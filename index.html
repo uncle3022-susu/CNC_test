@@ -1,0 +1,378 @@
+const CATEGORY_ORDER = ["CNC銑床", "機工類", "職業安全", "工作倫理", "環境保護", "節能減碳"];
+const CATEGORY_INFO = {
+  "CNC銑床": { slug:"cnc", mode:"ratio", label:"CNC銑床" },
+  "機工類": { slug:"machine", mode:"ratio", label:"機工類" },
+  "職業安全": { slug:"safety", mode:"single", label:"職業安全" },
+  "工作倫理": { slug:"ethics", mode:"single", label:"工作倫理" },
+  "環境保護": { slug:"environment", mode:"single", label:"環境保護" },
+  "節能減碳": { slug:"energy", mode:"single", label:"節能減碳" }
+};
+
+const STORAGE_KEY = "skill-quiz-state-v1";
+const app = document.getElementById("app");
+const main = document.getElementById("main");
+const pageTitle = document.getElementById("pageTitle");
+const bottomNav = document.getElementById("bottomNav");
+const modalRoot = document.getElementById("modalRoot");
+const toastRoot = document.getElementById("toastRoot");
+
+let questions = [];
+let stats = {};
+let state = loadState();
+let page = "quiz";
+let currentQuiz = null;
+let expandedReview = new Set();
+
+function defaultState(){ return { wrong:{}, history:[] }; }
+function loadState(){
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || defaultState(); }
+  catch { return defaultState(); }
+}
+function saveState(){ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
+function toast(msg){
+  toastRoot.innerHTML = `<div class="toast">${escapeHtml(msg)}</div>`;
+  setTimeout(()=>toastRoot.innerHTML="",2300);
+}
+function escapeHtml(s){ return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c])); }
+function shuffle(arr){
+  const a=[...arr];
+  for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; }
+  return a;
+}
+function byCategory(cat){ return questions.filter(q=>q.category===cat); }
+function answerKey(arr){ return [...arr].map(String).sort().join(","); }
+function isCorrect(q, selected){ return answerKey(q.answer)===answerKey(selected||[]); }
+function unique(arr){ return [...new Set(arr)]; }
+function safeCount(cat){ return byCategory(cat).length; }
+function ratioSplit(total){ return { single:Math.round(total*.7), multiple:total-Math.round(total*.7) }; }
+function buildQuiz(cat,total){
+  const pool=byCategory(cat);
+  if(!pool.length) return null;
+  total=Math.min(total,pool.length);
+  let selected=[];
+  if(CATEGORY_INFO[cat].mode==="ratio"){
+    let {single,multiple}=ratioSplit(total);
+    const singles=shuffle(pool.filter(q=>q.type==="single"));
+    const multis=shuffle(pool.filter(q=>q.type==="multiple"));
+    if(singles.length<single){ multiple+=single-singles.length; single=singles.length; }
+    if(multis.length<multiple){ single+=multiple-multis.length; multiple=multis.length; }
+    selected=[...singles.slice(0,single),...multis.slice(0,multiple)];
+    selected=selected.slice(0,total);
+    // If total is still short because one type ran out, fill from remaining unique pool.
+    if(selected.length<total){ const used=new Set(selected.map(q=>q.id)); selected.push(...shuffle(pool.filter(q=>!used.has(q.id))).slice(0,total-selected.length)); }
+    // Keep all singles before multiples. Extra fallback questions are sorted by type.
+    selected.sort((a,b)=>a.type===b.type?0:(a.type==="single"?-1:1));
+  } else {
+    selected=shuffle(pool.filter(q=>q.type==="single")).slice(0,total);
+  }
+  return {id:crypto.randomUUID?.()||String(Date.now()), category:cat, total:selected.length, questions:selected, answers:{}, index:0, startedAt:Date.now()};
+}
+function openPdf(q){
+  const info=CATEGORY_INFO[q.category];
+  const url=`pdfs/${info.slug}.pdf#page=${q.pdfPage}`;
+  window.open(url,"_blank","noopener");
+}
+function render(){
+  pageTitle.textContent = page==="quiz" ? (currentQuiz?"測驗中":"測驗") : "個人";
+  bottomNav.querySelectorAll(".nav-item").forEach(b=>b.classList.toggle("active",b.dataset.page===page));
+  document.getElementById("homeQuickBtn").style.visibility = page==="quiz" && !currentQuiz ? "hidden":"visible";
+  main.innerHTML = page==="quiz" ? (currentQuiz?(currentQuiz.finished?renderResults():renderQuiz()):renderQuizHome()) : renderProfile();
+  bindEvents();
+}
+function renderQuizHome(){
+  return `<section class="hero"><h2>今天想練哪一科？</h2><p>從題庫隨機抽題，同次測驗不重複；錯題會自動保存到個人。</p></section>
+  <div class="grid">${CATEGORY_ORDER.map((cat,i)=>{
+    const s=stats[cat]||{}; return `<button class="category-card" data-cat="${cat}">
+      <div class="num">0${i+1}</div><h3>${escapeHtml(cat)}</h3><p>${s.usable??safeCount(cat)} 題</p><span class="arrow">›</span>
+    </button>`;}).join("")}</div>
+  <section class="section"><div class="section-title"><span>題庫總覽</span></div><div class="stat-row">${[
+    ["總題數",questions.length],["錯題",Object.values(state.wrong).reduce((n,a)=>n+a.length,0)],["測驗次數",state.history.length]
+  ].map(([a,b])=>`<div class="stat"><b>${b}</b><span>${a}</span></div>`).join("")}</div></section>`;
+}
+function renderQuiz(){
+  const q=currentQuiz.questions[currentQuiz.index]; const selected=currentQuiz.answers[q.id]||[];
+  const pct=Math.round((currentQuiz.index+1)/currentQuiz.total*100);
+  return `<div class="quiz-shell">
+    <div class="quiz-meta"><span>第 ${currentQuiz.index+1} / ${currentQuiz.total} 題</span><span>${pct}%</span></div>
+    <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+    <article class="card question-card">
+      <div class="question-source">PDF 第 ${q.pdfPage} 頁${q.printedPage?` ・原印頁 ${q.printedPage}`:""}</div>
+      ${q.type==="multiple"?'<div class="question-type">複選題 · 可選擇多個答案</div>':''}
+      <div class="question-text">${escapeHtml(q.question)}</div>
+      <div class="option-list">${[1,2,3,4].map(n=>{
+        const text=q.options[String(n)]||""; const chosen=selected.includes(String(n));
+        return `<button class="option ${chosen?'selected':''} ${text?'':'missing'}" data-option="${n}"><span class="option-letter">${n}</span><span class="option-text">${text?escapeHtml(text):'此選項為 PDF 圖示內容，請查看原 PDF'}</span></button>`;
+      }).join("")}</div>
+      ${q.imageRequired?`<div class="source-callout">本題部分選項為圖示，網站題庫保留原 PDF 頁面。<a href="#" data-pdf="1">開啟 PDF 第 ${q.pdfPage} 頁</a></div>`:''}
+    </article>
+    <div class="quiz-actions"><button class="secondary-btn" data-action="prev" ${currentQuiz.index===0?'disabled':''}>上一題</button><button class="primary-btn" data-action="next" ${selected.length===0?'disabled':''}>${currentQuiz.index===currentQuiz.total-1?'完成測驗':'下一題'}</button></div>
+  </div>`;
+}
+function renderProfile(){
+  const wrongTotal=Object.values(state.wrong).reduce((n,a)=>n+a.length,0);
+  return `<section class="profile-header"><h2>我的學習</h2><p>曾經答錯的題目會留在這裡，方便日後複習。</p></section>
+  <section class="section"><div class="wrong-grid">${CATEGORY_ORDER.map(cat=>{const n=(state.wrong[cat]||[]).length; return `<button class="wrong-card" data-wrongcat="${cat}"><div><h3>${escapeHtml(cat)}錯題</h3><p>${n?`已累積 ${n} 題`:'目前沒有錯題'}</p></div><span class="count">${n}</span></button>`}).join("")}</div></section>
+  <section class="section"><div class="section-title"><span>最近測驗</span></div><div class="card">${state.history.length?state.history.slice(0,20).map(h=>`<div class="history-item"><div><b>${escapeHtml(h.category)}</b><div class="meta">${escapeHtml(h.date)} · ${h.total} 題 · 答對 ${h.correct} 題</div></div><span class="history-score">${h.accuracy}%</span></div>`).join(""):'<div class="empty">還沒有測驗紀錄</div>'}</div></section>
+  <section class="section"><div class="section-title"><span>資料管理</span><span>${wrongTotal} 個錯題</span></div><div class="manage"><button class="secondary-btn" data-manage="clearWrong">清除全部錯題</button><button class="secondary-btn" data-manage="clearHistory">清除測驗紀錄</button><button class="danger-btn" data-manage="clearAll">清除所有網站資料</button></div></section>`;
+}
+function openQuestionCountModal(cat, preset){
+  const max=safeCount(cat); const options=[];
+  for(let n=10;n<=100;n+=10) if(n<=max) options.push(n);
+  if(!options.length && max>0) options.push(max);
+  if(max>0 && max<10 && !options.includes(max)) options.unshift(max);
+  const defaultValue=preset||options[0]||0;
+  const info=CATEGORY_INFO[cat];
+  const ratio = info.mode==="ratio" ? ratioSplit(defaultValue) : {single:defaultValue,multiple:0};
+  modalRoot.innerHTML=`<div class="modal-backdrop" data-closemodal="1"><div class="modal" role="dialog" aria-modal="true">
+    <div class="eyebrow">START QUIZ</div><h3>${escapeHtml(cat)}</h3><p>選擇這次想做的題數。</p>
+    <select id="countSelect" class="select">${options.map(n=>`<option value="${n}" ${n===defaultValue?'selected':''}>${n} 題</option>`).join("")}</select>
+    <div id="ratioBox" class="ratio-box">${info.mode==="ratio"?`本次測驗：單選 ${ratio.single} 題・複選 ${ratio.multiple} 題`:'本次測驗：100% 單選題'}</div>
+    <div class="modal-actions"><button class="secondary-btn" data-close="1">取消</button><button class="primary-btn" data-start="1">開始測驗</button></div>
+  </div></div>`;
+  const select=document.getElementById("countSelect");
+  select?.addEventListener("change",()=>{const t=Number(select.value);const r=info.mode==="ratio"?ratioSplit(t):{single:t,multiple:0};document.getElementById("ratioBox").textContent=info.mode==="ratio"?`本次測驗：單選 ${r.single} 題・複選 ${r.multiple} 題`:'本次測驗：100% 單選題';});
+  modalRoot.querySelector('[data-start]')?.addEventListener('click',()=>{const total=Number(select.value);modalRoot.innerHTML="";currentQuiz=buildQuiz(cat,total);if(!currentQuiz){toast('此科目目前沒有可用題庫');return;}render();});
+  modalRoot.querySelectorAll('[data-close],[data-closemodal]').forEach(el=>el.addEventListener('click',()=>{if(el.dataset.closemodal && el.target!==el) return;modalRoot.innerHTML="";}));
+  modalRoot.querySelector('.modal').addEventListener('click',e=>e.stopPropagation());
+}
+function finishQuiz(){
+  const answers=currentQuiz.answers; const results=currentQuiz.questions.map(q=>({q,selected:answers[q.id]||[],correct:isCorrect(q,answers[q.id]||[])}));
+  const correct=results.filter(r=>r.correct).length, wrong=results.length-correct, accuracy=Math.round(correct/results.length*100);
+  const date=new Date().toLocaleString('zh-TW',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+  results.filter(r=>!r.correct).forEach(r=>{const arr=state.wrong[r.q.category]||[]; if(!arr.includes(r.q.id)) arr.push(r.q.id); state.wrong[r.q.category]=arr;});
+  state.history.unshift({date,category:currentQuiz.category,total:results.length,correct,wrong,accuracy}); state.history=state.history.slice(0,20); saveState();
+  currentQuiz={...currentQuiz,results,correct,wrong,accuracy,finished:true}; expandedReview=new Set(); render();
+}
+function renderResults(){
+  return `<section class="result-hero"><div class="score">${currentQuiz.accuracy}%</div><h2>${currentQuiz.accuracy===100?'太厲害了！':currentQuiz.accuracy>=80?'表現很好！':currentQuiz.accuracy>=60?'繼續努力！':'建議再複習錯題。'}</h2><p>${currentQuiz.category} · 共 ${currentQuiz.total} 題</p></section>
+  <div class="stat-row"><div class="stat"><b>${currentQuiz.correct}</b><span>答對</span></div><div class="stat"><b>${currentQuiz.wrong}</b><span>答錯</span></div><div class="stat"><b>${currentQuiz.total}</b><span>總題數</span></div></div>
+  <section class="section"><div class="section-title"><span>錯題檢視</span><span>${currentQuiz.wrong} 題</span></div><div class="review-list">${currentQuiz.results.filter(r=>!r.correct).map((r,i)=>reviewItem(r,i)).join('') || '<div class="card empty">這次全部答對，沒有錯題 🎉</div>'}</div></section>
+  <button class="primary-btn full-btn" data-result="retry">重新測驗</button>
+  <button class="secondary-btn full-btn" data-result="home">返回測驗首頁</button>`;
+}
+function reviewItem(r,i){
+  const open=expandedReview.has(r.q.id);
+  return `<div class="review-item"><button class="review-head" data-review="${r.q.id}"><span>錯題 ${i+1} ・ PDF 第 ${r.q.pdfPage} 頁</span><span>${open?'⌃':'⌄'}</span></button>${open?`<div class="review-body"><div class="q">${escapeHtml(r.q.question)}</div><div class="answer-line"><span class="tag-wrong">你的答案</span><div class="answers">${(r.selected.length?r.selected:['未作答']).map(x=>`<span class="answer-chip">${x}</span>`).join('')}</div></div><div class="answer-line"><span class="tag-correct">正確答案</span><div class="answers">${r.q.answer.map(x=>`<span class="answer-chip correct">${x}</span>`).join('')}</div></div>${r.q.imageRequired?`<div class="source-callout"><a href="#" data-resultpdf="${r.q.id}">開啟 PDF 原頁</a></div>`:''}</div>`:''}</div>`;
+}
+function renderQuizPage(){
+  if(currentQuiz.finished) return renderResults();
+  return renderQuiz();
+}
+function bindEvents(){
+  document.querySelectorAll('.category-card').forEach(b=>b.addEventListener('click',()=>openQuestionCountModal(b.dataset.cat)));
+  document.querySelectorAll('.wrong-card').forEach(b=>b.addEventListener('click',()=>openWrongModal(b.dataset.wrongcat)));
+  document.querySelectorAll('[data-option]').forEach(b=>b.addEventListener('click',()=>{
+    const q=currentQuiz.questions[currentQuiz.index]; const selected=new Set(currentQuiz.answers[q.id]||[]); const val=b.dataset.option;
+    if(q.type==='single'){ currentQuiz.answers[q.id]=[val]; } else { selected.has(val)?selected.delete(val):selected.add(val); currentQuiz.answers[q.id]=[...selected].sort(); }
+    render();
+  }));
+  document.querySelectorAll('[data-action="prev"]').forEach(b=>b.addEventListener('click',()=>{if(currentQuiz.index>0){currentQuiz.index--;render();}}));
+  document.querySelectorAll('[data-action="next"]').forEach(b=>b.addEventListener('click',()=>{
+    const q=currentQuiz.questions[currentQuiz.index]; if(!(currentQuiz.answers[q.id]||[]).length)return;
+    if(currentQuiz.index===currentQuiz.total-1) finishQuiz(); else {currentQuiz.index++;render();}
+  }));
+  document.querySelectorAll('[data-pdf]').forEach(a=>a.addEventListener('click',e=>{e.preventDefault();const q=currentQuiz.questions[currentQuiz.index];openPdf(q);}));
+  document.querySelectorAll('[data-review]').forEach(b=>b.addEventListener('click',()=>{expandedReview.has(b.dataset.review)?expandedReview.delete(b.dataset.review):expandedReview.add(b.dataset.review);render();}));
+  document.querySelectorAll('[data-result]').forEach(b=>b.addEventListener('click',()=>{if(b.dataset.result==='home'){currentQuiz=null;render();}else{currentQuiz=buildQuiz(currentQuiz.category,currentQuiz.total);render();}}));
+  document.querySelectorAll('[data-resultpdf]').forEach(a=>a.addEventListener('click',e=>{e.preventDefault();const id=a.dataset.resultpdf;const r=currentQuiz.results.find(x=>x.q.id===id);if(r)openPdf(r.q);}));
+  document.querySelectorAll('[data-manage]').forEach(b=>b.addEventListener('click',()=>manageData(b.dataset.manage)));
+}
+function openWrongModal(cat){
+  const ids=new Set(state.wrong[cat]||[]); const qs=byCategory(cat).filter(q=>ids.has(q.id));
+  modalRoot.innerHTML=`<div class="modal-backdrop" data-wrongback="1"><div class="modal" role="dialog" aria-modal="true" style="max-height:90vh;overflow:auto">
+   <div class="eyebrow">WRONG QUESTIONS</div><h3>${escapeHtml(cat)}錯題</h3><p>${qs.length?`共 ${qs.length} 題。正確答案以黃色螢光標記。`:'目前沒有錯題。'}</p>
+   ${qs.map((q,i)=>`<div class="review-item" style="margin-top:10px"><div class="review-body" style="padding:14px"><div class="q">${i+1}. ${escapeHtml(q.question)}</div><div class="answers" style="margin-top:10px">${[1,2,3,4].map(n=>`<span class="answer-chip ${q.answer.includes(String(n))?'correct':''}">${n}. ${q.options[String(n)]?escapeHtml(q.options[String(n)]):'PDF 圖示選項'}</span>`).join('')}</div><div class="answer-line" style="color:#8a93a3">PDF 第 ${q.pdfPage} 頁</div></div></div>`).join('')}
+   <div class="modal-actions"><button class="secondary-btn" data-closewrong="1">關閉</button><button class="primary-btn" data-practice="1" ${qs.length?'':'disabled'}>重新練習</button></div>
+  </div></div>`;
+  modalRoot.querySelector('[data-closewrong]')?.addEventListener('click',()=>modalRoot.innerHTML='');
+  modalRoot.querySelector('[data-practice]')?.addEventListener('click',()=>{modalRoot.innerHTML='';const pool=qs; if(!pool.length)return; const total=Math.min(10,pool.length); currentQuiz={id:String(Date.now()),category:cat,total,questions:shuffle(pool).slice(0,total),answers:{},index:0,startedAt:Date.now()}; page='quiz';render();});
+  modalRoot.querySelector('[data-wrongback]')?.addEventListener('click',e=>{if(e.target===e.currentTarget) modalRoot.innerHTML='';});
+}
+function manageData(kind){
+  const msg={clearWrong:'確定要清除所有錯題嗎？這個動作無法復原。',clearHistory:'確定要清除測驗紀錄嗎？',clearAll:'確定要清除所有網站資料嗎？'}[kind];
+  modalRoot.innerHTML=`<div class="modal-backdrop"><div class="modal"><h3>確認操作</h3><p>${msg}</p><div class="modal-actions"><button class="secondary-btn" data-cancel>取消</button><button class="danger-btn" data-ok>確定</button></div></div></div>`;
+  modalRoot.querySelector('[data-cancel]').addEventListener('click',()=>modalRoot.innerHTML='');
+  modalRoot.querySelector('[data-ok]').addEventListener('click',()=>{if(kind==='clearWrong')state.wrong={};if(kind==='clearHistory')state.history=[];if(kind==='clearAll'){state=defaultState();localStorage.removeItem(STORAGE_KEY);}saveState();modalRoot.innerHTML='';toast('資料已更新');render();});
+}
+
+bottomNav.querySelectorAll('.nav-item').forEach(b=>b.addEventListener('click',()=>{ if(currentQuiz && page==='quiz' && !currentQuiz.finished){toast('測驗進行中，請完成本次測驗');return;} page=b.dataset.page; render(); }));
+document.getElementById('homeQuickBtn').addEventListener('click',()=>{if(currentQuiz && !currentQuiz.finished){toast('請完成本次測驗後再離開');return;} currentQuiz=null;page='quiz';render();});
+
+fetch('data/questions.json').then(r=>{if(!r.ok)throw new Error('題庫載入失敗');return r.json()}).then(data=>{questions=data;return fetch('data/stats.json')}).then(r=>r.json()).then(s=>{stats=s;render();}).catch(err=>{main.innerHTML=`<div class="card empty">題庫載入失敗，請重新整理頁面。<br><small>${escapeHtml(err.message)}</small></div>`;});
+
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f6f7fb" />
+  <meta name="description" content="技術士技能檢定學科刷題練習" />
+  <title>技能學科練習</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">SKILL PRACTICE</div>
+        <h1 id="pageTitle">測驗</h1>
+      </div>
+      <button id="homeQuickBtn" class="icon-btn" aria-label="回到測驗首頁" title="回到測驗首頁">
+        <span>⌂</span>
+      </button>
+    </header>
+
+    <main id="main" class="main-content"></main>
+
+    <nav id="bottomNav" class="bottom-nav" aria-label="主要導覽">
+      <button class="nav-item active" data-page="quiz"><span class="nav-icon">✓</span><span>測驗</span></button>
+      <button class="nav-item" data-page="profile"><span class="nav-icon">●</span><span>個人</span></button>
+    </nav>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div id="toastRoot" aria-live="polite" aria-atomic="true"></div>
+  <script src="app.js" defer></script>
+</body>
+</html>
+
+:root{
+  --bg:#f6f7fb;
+  --card:#ffffff;
+  --text:#182230;
+  --muted:#778196;
+  --line:#e5e9f0;
+  --primary:#3157d5;
+  --primary-weak:#eef2ff;
+  --success:#16865b;
+  --success-weak:#eaf8f1;
+  --danger:#c54a4a;
+  --danger-weak:#fff0f0;
+  --warning:#e6b300;
+  --shadow:0 10px 30px rgba(20,31,55,.07);
+  --radius:18px;
+  --nav-height:76px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif}
+body{min-height:100vh}
+button,select{font:inherit}
+button{cursor:pointer}
+button:disabled{cursor:not-allowed;opacity:.45}
+.app-shell{max-width:520px;min-height:100vh;margin:0 auto;position:relative}
+.topbar{position:sticky;top:0;z-index:20;display:flex;justify-content:space-between;align-items:center;padding:18px 18px 14px;background:rgba(246,247,251,.9);backdrop-filter:blur(16px)}
+.eyebrow{font-size:10px;letter-spacing:.18em;font-weight:800;color:var(--primary);margin-bottom:3px}
+h1{font-size:25px;line-height:1.15;margin:0;font-weight:850;letter-spacing:-.02em}
+.icon-btn{width:42px;height:42px;border:1px solid var(--line);border-radius:14px;background:#fff;color:var(--text);box-shadow:var(--shadow);display:grid;place-items:center;font-size:20px}
+.main-content{padding:6px 16px calc(var(--nav-height) + 18px)}
+.hero{padding:18px 4px 10px}
+.hero h2{margin:0;font-size:30px;letter-spacing:-.035em}
+.hero p{margin:8px 0 0;color:var(--muted);line-height:1.55}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.category-card{position:relative;min-height:142px;padding:18px;border:1px solid var(--line);border-radius:22px;background:linear-gradient(180deg,#fff,#fbfcff);box-shadow:var(--shadow);text-align:left;overflow:hidden}
+.category-card:after{content:"";position:absolute;right:-28px;bottom:-30px;width:92px;height:92px;border-radius:50%;background:var(--primary-weak)}
+.category-card .num{font-size:11px;font-weight:800;color:var(--primary);letter-spacing:.12em}
+.category-card h3{margin:8px 0 4px;font-size:19px;line-height:1.25}
+.category-card p{margin:0;color:var(--muted);font-size:12px}
+.category-card .arrow{position:absolute;right:16px;bottom:14px;font-size:18px;color:var(--muted)}
+.section{margin-top:20px}
+.section-title{display:flex;justify-content:space-between;align-items:center;margin:0 2px 10px;font-size:15px;font-weight:800}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+.stat-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.stat{padding:14px;border-radius:16px;background:#fff;border:1px solid var(--line)}
+.stat b{display:block;font-size:21px;margin-bottom:3px}.stat span{font-size:11px;color:var(--muted)}
+.empty{padding:26px 18px;text-align:center;color:var(--muted)}
+.quiz-shell{min-height:calc(100vh - var(--nav-height) - 80px);display:flex;flex-direction:column}
+.quiz-meta{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:13px;margin:8px 2px}
+.progress-track{height:8px;background:#e8ebf2;border-radius:99px;overflow:hidden;margin-bottom:16px}
+.progress-fill{height:100%;background:linear-gradient(90deg,var(--primary),#5578e4);border-radius:99px;transition:width .25s ease}
+.question-card{padding:20px 18px}
+.question-source{font-size:11px;color:#9aa3b4;margin-bottom:10px}
+.question-type{display:inline-flex;align-items:center;gap:6px;padding:6px 9px;border-radius:999px;background:var(--primary-weak);color:var(--primary);font-size:11px;font-weight:800;margin-bottom:12px}
+.question-text{font-size:20px;line-height:1.65;font-weight:780;letter-spacing:-.01em;white-space:pre-wrap}
+.option-list{display:grid;gap:10px;margin-top:18px}
+.option{display:flex;align-items:flex-start;gap:12px;width:100%;padding:15px 14px;border:1px solid var(--line);border-radius:16px;background:#fff;text-align:left;transition:transform .12s ease,border-color .12s ease,background .12s ease}
+.option:active{transform:scale(.99)}
+.option.selected{border-color:var(--primary);background:var(--primary-weak)}
+.option-letter{width:32px;height:32px;flex:0 0 32px;border-radius:10px;display:grid;place-items:center;background:#f1f3f7;color:#4c5669;font-weight:850}
+.option.selected .option-letter{background:var(--primary);color:#fff}
+.option-text{font-size:15px;line-height:1.55;padding-top:4px;white-space:pre-wrap}
+.option.missing .option-text{color:var(--muted);font-size:13px}
+.source-callout{margin-top:14px;padding:12px 13px;border-radius:14px;background:#f8f9fb;border:1px dashed #d6dbe6;color:var(--muted);font-size:12px;line-height:1.5}
+.source-callout a{color:var(--primary);font-weight:800;text-decoration:none}
+.quiz-actions{position:sticky;bottom:calc(var(--nav-height) - 1px);z-index:15;display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:12px 0;background:linear-gradient(180deg,rgba(246,247,251,0),rgba(246,247,251,.96) 20%)}
+.primary-btn,.secondary-btn,.danger-btn{min-height:50px;border-radius:16px;border:1px solid transparent;font-weight:850}
+.primary-btn{background:var(--primary);color:#fff;box-shadow:0 8px 18px rgba(49,87,213,.2)}
+.secondary-btn{background:#fff;border-color:var(--line);color:var(--text)}
+.danger-btn{background:var(--danger);color:#fff}
+.full-btn{width:100%;margin-top:10px}
+.modal-backdrop{position:fixed;inset:0;z-index:50;background:rgba(11,16,28,.46);display:flex;align-items:flex-end;justify-content:center;padding:12px}
+.modal{width:min(520px,100%);background:#fff;border-radius:24px;padding:20px;box-shadow:0 24px 80px rgba(0,0,0,.22);animation:slideUp .18s ease}
+.modal h3{margin:0;font-size:21px}.modal p{color:var(--muted);line-height:1.5;font-size:13px}
+.modal-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:16px}
+.select{width:100%;height:50px;border-radius:14px;border:1px solid var(--line);padding:0 14px;background:#fff}
+.ratio-box{margin-top:12px;padding:12px;border-radius:14px;background:#f8f9ff;border:1px solid #e4e9ff;font-size:13px;line-height:1.65}
+.result-hero{padding:24px 10px 14px;text-align:center}.score{font-size:64px;line-height:1;font-weight:900;color:var(--primary)}.result-hero h2{margin:10px 0 4px;font-size:24px}.result-hero p{margin:0;color:var(--muted)}
+.review-list{display:grid;gap:10px;margin-top:12px}
+.review-item{overflow:hidden;background:#fff;border:1px solid var(--line);border-radius:16px}
+.review-head{width:100%;display:flex;justify-content:space-between;gap:12px;align-items:center;padding:14px;border:0;background:#fff;text-align:left;font-weight:800}
+.review-body{padding:0 14px 15px}.review-body .q{font-weight:760;line-height:1.55}.answer-line{margin-top:10px;font-size:13px}.tag-correct{color:var(--success);background:var(--success-weak);padding:4px 7px;border-radius:8px}.tag-wrong{color:var(--danger);background:var(--danger-weak);padding:4px 7px;border-radius:8px}
+.answers{display:flex;flex-wrap:wrap;gap:8px;margin-top:7px}.answer-chip{padding:7px 9px;border-radius:10px;background:#f4f5f8;font-size:13px}.answer-chip.correct{background:linear-gradient(180deg,#fff8a5,#fff27e);box-shadow:inset 0 -1px 0 #ead24a}
+.profile-header{padding:12px 0 2px}.profile-header h2{font-size:28px;margin:0}.profile-header p{margin:6px 0 0;color:var(--muted)}
+.wrong-grid{display:grid;gap:10px}.wrong-card{display:flex;justify-content:space-between;align-items:center;padding:16px;border:1px solid var(--line);background:#fff;border-radius:18px;box-shadow:var(--shadow)}.wrong-card h3{margin:0 0 4px;font-size:16px}.wrong-card p{margin:0;color:var(--muted);font-size:12px}.wrong-card .count{min-width:44px;height:44px;border-radius:14px;background:var(--primary-weak);color:var(--primary);display:grid;place-items:center;font-weight:900}
+.history-item{display:flex;justify-content:space-between;align-items:center;padding:14px 15px;border-bottom:1px solid var(--line)}.history-item:last-child{border-bottom:0}.history-item .meta{color:var(--muted);font-size:12px;margin-top:3px}.history-score{font-weight:900;color:var(--primary)}
+.manage{display:grid;gap:8px}
+.bottom-nav{position:fixed;left:50%;transform:translateX(-50%);bottom:0;width:min(520px,100%);height:var(--nav-height);padding:9px 14px calc(9px + env(safe-area-inset-bottom));display:grid;grid-template-columns:1fr 1fr;gap:8px;background:rgba(255,255,255,.94);backdrop-filter:blur(18px);border-top:1px solid var(--line);z-index:40}
+.nav-item{border:0;background:transparent;border-radius:16px;color:#8a93a3;font-size:12px;font-weight:800;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px}.nav-item.active{color:var(--primary);background:var(--primary-weak)}.nav-icon{font-size:18px;line-height:1}
+.toast{position:fixed;left:50%;bottom:calc(var(--nav-height) + 16px);transform:translateX(-50%);z-index:80;background:#202533;color:#fff;padding:10px 14px;border-radius:12px;box-shadow:var(--shadow);font-size:13px;animation:fadeIn .18s ease;max-width:88%;text-align:center}
+@keyframes slideUp{from{transform:translateY(14px);opacity:.6}to{transform:none;opacity:1}}
+@keyframes fadeIn{from{opacity:0;transform:translate(-50%,4px)}to{opacity:1;transform:translate(-50%,0)}}
+@media (min-width:700px){body{padding:20px 0}.app-shell{border-radius:28px;overflow:hidden;box-shadow:0 10px 60px rgba(20,31,55,.08);background:var(--bg)}}
+
+# 技能學科練習網站
+
+這是一個純前端、Mobile First 的技能檢定學科刷題網站，無需 Node / npm / 後端即可部署到 GitHub Pages。
+
+## 最簡單的 GitHub Pages 部署方式
+
+1. 在 GitHub 建立一個新的 Repository。
+2. 將這個專案裡的所有檔案與資料夾全部上傳到 Repository 根目錄。
+3. 進入 Repository → Settings → Pages。
+4. 在 Build and deployment 選擇 `Deploy from a branch`。
+5. Branch 選 `main`，資料夾選 `/ (root)`，儲存。
+6. 等待 GitHub Pages 部署完成後，使用 GitHub 顯示的網址開啟即可。
+
+本專案沒有 React、Vite、npm build 流程，因此不需要 `npm run dev` 或 `npm run build`。
+
+## 題庫
+
+題庫位於 `data/questions.json`，統計位於 `data/stats.json`。
+PDF 原始檔案位於 `pdfs/`，網站可在圖示題中開啟對應 PDF 頁面。
+
+## 六科固定順序
+
+1. CNC銑床
+2. 機工類
+3. 職業安全
+4. 工作倫理
+5. 環境保護
+6. 節能減碳
+
+## 出題規則
+
+CNC銑床、機工類：70% 單選、30% 複選，且單選先出、複選後出。
+其餘四科：100% 單選。
+同次測驗不重複出題；複選題需答案集合完全一致才算答對。
+
+## 本次題庫轉換結果
+
+- CNC銑床：773 題（原題目 775 題，刪除 2 題）
+- 機工類：475 題（原題目 479 題，刪除 4 題）
+- 職業安全：100 題
+- 工作倫理：100 題
+- 環境保護：95 題（原題目 100 題，刪除 5 題）
+- 節能減碳：100 題
+
+共 1643 題。
+
+部分 PDF 題目是圖片選項，文字抽取無法完整還原；網站會保留 `imageRequired` 標記，並在測驗中提供「開啟 PDF 原頁」功能。
